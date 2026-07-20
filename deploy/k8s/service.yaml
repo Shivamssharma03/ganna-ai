@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-demogaanaai-devops
+  namespace: ai-demogaanaai-devops-dev
+  labels:
+    app: ai-demogaanaai-devops
+spec:
+  type: LoadBalancer
+  selector:
+    app: ai-demogaanaai-devops
+  ports:
+    - port: 80
+      targetPort: 3000
+      protocol: TCP

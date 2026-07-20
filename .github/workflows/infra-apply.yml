@@ -1,0 +1,238 @@
+name: Infra Apply
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      # ## Source checkout: use the infra config already merged into this branch
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ## AWS OIDC authentication: assume the bootstrapped GitHub Actions role, never long-lived keys
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::478546323821:role/ai-demogaanaai-devops-dev-gha
+          aws-region: us-west-2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      # ## Secret retrieval: fetch the Datadog API key (default EKS add-on) and export it as a Terraform variable
+      - name: Fetch Datadog secret
+        run: |
+          set -euo pipefail
+          secret_json=$(aws secretsmanager get-secret-value --secret-id /platform/dev/datadog --query SecretString --output text)
+          api_key=$(echo "$secret_json" | jq -r '.api_key')
+          echo "::add-mask::$api_key"
+          echo "TF_VAR_datadog_api_key=$api_key" >> "$GITHUB_ENV"
+
+      # ## Terraform validation: init and validate before touching real infra
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform validate
+        run: terraform validate
+
+      # ## VPC readiness sequencing: on a fresh deploy, apply networking first and confirm NAT/private routes
+      # are active before EKS/node groups exist, so nodes never try to join a network without egress.
+      - name: Check whether VPC is already in state
+        id: state_check
+        run: |
+          if terraform state list 2>/dev/null | grep -q '^module\.vpc\.'; then
+            echo "vpc_in_state=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "vpc_in_state=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Targeted apply - VPC module
+        if: steps.state_check.outputs.vpc_in_state == 'false'
+        run: terraform apply -auto-approve -input=false -target=module.vpc
+
+      - name: Verify NAT gateway and private routes are active
+        if: steps.state_check.outputs.vpc_in_state == 'false'
+        run: |
+          set -euo pipefail
+          vpc_id=$(terraform output -raw vpc_id)
+          nat_state=$(aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$vpc_id" "Name=state,Values=available,pending" --query 'NatGateways[0].State' --output text)
+          echo "NAT gateway state: $nat_state"
+          if [ "$nat_state" != "available" ]; then
+            echo "NAT gateway is not available yet ($nat_state); aborting before EKS/node-group creation." >&2
+            exit 1
+          fi
+          active_routes=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc_id" --query "RouteTables[].Routes[?DestinationCidrBlock=='0.0.0.0/0' && NatGatewayId!=null]" --output text)
+          if [ -z "$active_routes" ]; then
+            echo "No private route table has an active 0.0.0.0/0 NAT route yet." >&2
+            exit 1
+          fi
+
+      # ## Terraform apply: idempotent - reports "No changes" and exits quickly when nothing has drifted
+      - name: Terraform apply
+        id: apply
+        shell: bash
+        run: |
+          set +e
+          terraform apply -auto-approve -input=false 2>&1 | tee apply-output.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Upload apply output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-apply-${{ github.run_id }}
+          path: infra/terraform/apply-output.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+      # ## Node-group health gate: on failure, diagnose whether it is a CREATE_FAILED/NodeCreationFailure node
+      # group actually referenced in this apply's output - never assume the first lexicographic default-* group.
+      - name: Diagnose node group failures
+        id: diagnose
+        if: steps.apply.outputs.exitcode != '0'
+        run: |
+          set -euo pipefail
+          cluster_name="ai-demogaanaai-devops-dev"
+          echo "Terraform apply failed (exit ${{ steps.apply.outputs.exitcode }}). Inspecting managed node groups for $cluster_name..."
+          node_groups=$(aws eks list-nodegroups --cluster-name "$cluster_name" --query 'nodegroups' --output text 2>/dev/null || true)
+          failed_addr=""
+          for ng in $node_groups; do
+            status=$(aws eks describe-nodegroup --cluster-name "$cluster_name" --nodegroup-name "$ng" --query 'nodegroup.status' --output text)
+            echo "Node group $ng status: $status"
+            aws eks describe-nodegroup --cluster-name "$cluster_name" --nodegroup-name "$ng" --query 'nodegroup.health.issues'
+            if [ "$status" = "CREATE_FAILED" ] && grep -q -- "$ng" apply-output.txt; then
+              failed_addr=$(terraform state list | grep 'module.eks' | grep 'eks_managed_node_group' | grep 'default' || true)
+              echo "failed_nodegroup=$ng" >> "$GITHUB_OUTPUT"
+              echo "failed_resource_addr=$failed_addr" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
+      # ## Network prerequisite check: never retry a node-join failure that is actually a missing NAT/route
+      - name: Check NAT/route health before retrying
+        id: nat_check
+        if: steps.apply.outputs.exitcode != '0' && steps.diagnose.outputs.failed_nodegroup != ''
+        run: |
+          set -euo pipefail
+          vpc_id=$(terraform output -raw vpc_id)
+          echo "Private subnet route tables for $vpc_id:"
+          aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc_id" \
+            --query "RouteTables[].{RouteTableId:RouteTableId,Routes:Routes[?DestinationCidrBlock=='0.0.0.0/0']}"
+          nat_ok=$(aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$vpc_id" --query "NatGateways[?State=='available']" --output text)
+          if [ -z "$nat_ok" ]; then
+            echo "nat_ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "nat_ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail with network prerequisite diagnostics
+        if: steps.apply.outputs.exitcode != '0' && steps.diagnose.outputs.failed_nodegroup != '' && steps.nat_check.outputs.nat_ok == 'false'
+        run: |
+          echo "Node group creation failed and at least one private subnet lacks an active NAT/default route." >&2
+          echo "This is a network prerequisite failure, not a transient bootstrap timeout - not retrying." >&2
+          exit 1
+
+      # ## One-time guarded recovery: exactly one targeted replace of the specific failed node-group resource
+      # address present in terraform state list. Never an unconditional -replace, never a retry loop.
+      - name: Targeted replace of failed node group
+        id: retry
+        if: steps.apply.outputs.exitcode != '0' && steps.diagnose.outputs.failed_resource_addr != '' && steps.nat_check.outputs.nat_ok == 'true'
+        run: |
+          set -euo pipefail
+          addr="${{ steps.diagnose.outputs.failed_resource_addr }}"
+          echo "Retrying with a single targeted replace of: $addr"
+          terraform apply -auto-approve -input=false -replace="$addr" 2>&1 | tee retry-output.txt
+
+      - name: Upload retry output
+        if: always() && steps.retry.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-retry-${{ github.run_id }}
+          path: infra/terraform/retry-output.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Fail with node bootstrap diagnostics
+        if: steps.apply.outputs.exitcode != '0' && steps.diagnose.outputs.failed_resource_addr == ''
+        run: |
+          echo "Terraform apply failed for a reason other than a recognized CREATE_FAILED node group; not retrying." >&2
+          echo "Recommend the read-only AWSSupport-TroubleshootEKSWorkerNode runbook or node-local nodeadm/kubelet/containerd/CNI journals for deeper diagnosis." >&2
+          exit 1
+
+      - name: Fail if recovery attempt did not succeed
+        if: steps.apply.outputs.exitcode != '0' && steps.diagnose.outputs.failed_resource_addr != '' && steps.retry.outcome != 'success'
+        run: |
+          echo "A second NodeCreationFailure occurred after the single guarded retry. This is blocking." >&2
+          echo "Recommend the read-only AWSSupport-TroubleshootEKSWorkerNode runbook or node-local nodeadm/kubelet/containerd/CNI journals for deeper diagnosis." >&2
+          exit 1
+
+      # ## Kubernetes readiness gate: application deploy must not begin until the node group is ACTIVE and
+      # healthy, and all expected nodes report Ready.
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ai-demogaanaai-devops-dev --region us-west-2
+
+      - name: Wait for node group ACTIVE and nodes Ready
+        run: |
+          set -euo pipefail
+          cluster_name="ai-demogaanaai-devops-dev"
+          deadline=$((SECONDS + 900))
+
+          node_groups=$(aws eks list-nodegroups --cluster-name "$cluster_name" --query 'nodegroups' --output text)
+          for ng in $node_groups; do
+            while :; do
+              status=$(aws eks describe-nodegroup --cluster-name "$cluster_name" --nodegroup-name "$ng" --query 'nodegroup.status' --output text)
+              issues=$(aws eks describe-nodegroup --cluster-name "$cluster_name" --nodegroup-name "$ng" --query 'nodegroup.health.issues' --output text)
+              echo "Node group $ng: status=$status issues=$issues"
+              if [ "$status" = "ACTIVE" ] && [ -z "$issues" ]; then
+                break
+              fi
+              if [ "$status" = "CREATE_FAILED" ] || [ "$status" = "DEGRADED" ]; then
+                echo "Node group $ng is unhealthy after the apply/recovery sequence." >&2
+                aws eks describe-nodegroup --cluster-name "$cluster_name" --nodegroup-name "$ng"
+                exit 1
+              fi
+              if [ $SECONDS -ge $deadline ]; then
+                echo "Timed out waiting for node group $ng to become ACTIVE." >&2
+                exit 1
+              fi
+              sleep 20
+            done
+          done
+
+          expected=0
+          for ng in $node_groups; do
+            size=$(aws eks describe-nodegroup --cluster-name "$cluster_name" --nodegroup-name "$ng" --query 'nodegroup.scalingConfig.desiredSize' --output text)
+            expected=$((expected + size))
+          done
+
+          while :; do
+            ready=$(kubectl get nodes --no-headers 2>/dev/null | awk '$2 == "Ready"' | wc -l)
+            echo "Ready nodes: $ready / expected: $expected"
+            if [ "$ready" -ge "$expected" ]; then
+              kubectl get nodes -o wide
+              exit 0
+            fi
+            if [ $SECONDS -ge $deadline ]; then
+              echo "Timed out waiting for nodes to become Ready." >&2
+              kubectl get nodes -o wide || true
+              kubectl get events -A --sort-by=.lastTimestamp | tail -n 50 || true
+              for ng in $node_groups; do
+                aws eks describe-nodegroup --cluster-name "$cluster_name" --nodegroup-name "$ng" --query 'nodegroup.health.issues'
+              done
+              exit 1
+            fi
+            sleep 20
+          done

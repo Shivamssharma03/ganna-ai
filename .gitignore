@@ -1,1 +1,11 @@
 node_modules
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/plan-output.txt
+infra/terraform/apply-output.txt
+infra/terraform/retry-output.txt
+coverage/
+.scannerwork/
+sonar-report/
+trivy-report/

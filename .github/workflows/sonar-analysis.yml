@@ -1,0 +1,155 @@
+name: SonarQube Analysis
+
+on:
+  pull_request:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  sonar:
+    runs-on: ubuntu-latest
+    steps:
+      # ## Source checkout: full history so SonarCloud can compute blame/new-code accurately
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ## AWS OIDC authentication: assume the bootstrapped GitHub Actions role to reach Secrets Manager
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::478546323821:role/ai-demogaanaai-devops-dev-gha
+          aws-region: us-west-2
+
+      # ## Secret retrieval: shared platform SonarQube token from Secrets Manager, masked and never echoed
+      - name: Fetch SonarQube token
+        run: |
+          set -euo pipefail
+          secret_json=$(aws secretsmanager get-secret-value --secret-id /platform/dev/sonarqube --query SecretString --output text)
+          token=$(echo "$secret_json" | jq -r '.token')
+          echo "::add-mask::$token"
+          echo "SONAR_TOKEN=$token" >> "$GITHUB_ENV"
+
+      # ## Dependency installation and tests with coverage: input for Sonar's JS analyzer
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm run test:coverage
+
+      # ## Sonar identity/org checks: validate the token and confirm org access before touching the project
+      - name: Validate Sonar token and organization
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/sonar-checks
+
+          status=$(curl -s -o /tmp/sonar-checks/validate.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${SONAR_TOKEN}" \
+            "https://sonarcloud.io/api/authentication/validate")
+          valid=$(jq -r '.valid' /tmp/sonar-checks/validate.json)
+          if [ "$status" != "200" ] || [ "$valid" != "true" ]; then
+            echo "Sonar token validation failed (HTTP $status)." >&2
+            exit 1
+          fi
+
+          curl -s -H "Authorization: Bearer ${SONAR_TOKEN}" "https://sonarcloud.io/api/users/current" -o /tmp/sonar-checks/current-user.json
+          echo "Token belongs to: $(jq -r '.login' /tmp/sonar-checks/current-user.json)"
+
+          curl -s -H "Authorization: Bearer ${SONAR_TOKEN}" \
+            "https://sonarcloud.io/api/organizations/search?organizations=shivamssharma03" \
+            -o /tmp/sonar-checks/org.json
+          org_key=$(jq -r '.organizations[0].key // empty' /tmp/sonar-checks/org.json)
+          if [ "$org_key" != "shivamssharma03" ]; then
+            echo "Organization shivamssharma03 not found or not accessible for this token." >&2
+            exit 1
+          fi
+          echo "provision=$(jq -r '.organizations[0].actions.provision' /tmp/sonar-checks/org.json)" >> "$GITHUB_ENV"
+
+      # ## Idempotent project provisioning: create the SonarCloud project only when it does not already exist
+      - name: Ensure SonarCloud project exists
+        run: |
+          set -euo pipefail
+          status=$(curl -s -o /tmp/sonar-checks/show.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${SONAR_TOKEN}" \
+            "https://sonarcloud.io/api/components/show?component=shivamssharma03_ganna-ai")
+
+          if [ "$status" = "200" ]; then
+            echo "Project already provisioned."
+            exit 0
+          fi
+
+          if [ "$status" != "404" ]; then
+            echo "Unexpected status checking project existence: $status" >&2
+            cat /tmp/sonar-checks/show.json >&2
+            exit 1
+          fi
+
+          if [ "$provision" != "true" ]; then
+            echo "Project shivamssharma03_ganna-ai does not exist and this token's user lacks the organization's Create Projects permission." >&2
+            exit 1
+          fi
+
+          create_status=$(curl -s -o /tmp/sonar-checks/create.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${SONAR_TOKEN}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data "organization=shivamssharma03&project=shivamssharma03_ganna-ai&name=ganna-ai" \
+            "https://sonarcloud.io/api/projects/create")
+          if [ "$create_status" != "200" ] && [ "$create_status" != "201" ]; then
+            echo "Failed to create SonarCloud project (HTTP $create_status):" >&2
+            cat /tmp/sonar-checks/create.json >&2
+            exit 1
+          fi
+
+      - name: Clean up Sonar API diagnostics
+        if: always()
+        run: rm -rf /tmp/sonar-checks
+
+      # ## Sonar analysis and quality gate: install the pinned scanner CLI and run static analysis
+      - name: Install SonarScanner CLI
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.sonar"
+          curl -sSLo "$HOME/.sonar/sonar-scanner.zip" \
+            "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-8.0.1.6346-linux-x64.zip"
+          unzip -q "$HOME/.sonar/sonar-scanner.zip" -d "$HOME/.sonar"
+          echo "$HOME/.sonar/sonar-scanner-8.0.1.6346-linux-x64/bin" >> "$GITHUB_PATH"
+
+      - name: Run SonarScanner
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          mkdir -p sonar-report
+          sonar-scanner \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.organization="shivamssharma03" \
+            -Dsonar.projectKey="shivamssharma03_ganna-ai" \
+            -Dsonar.token="$SONAR_TOKEN" \
+            -Dsonar.qualitygate.wait=true \
+            2>&1 | tee sonar-report/sonar-scan.log
+
+      - name: Collect Sonar task report
+        if: always()
+        run: |
+          if [ -f .scannerwork/report-task.txt ]; then
+            cp .scannerwork/report-task.txt sonar-report/
+          fi
+
+      # ## Diagnostic artifact only: the authoritative issues/quality-gate result lives in SonarCloud
+      - name: Upload Sonar report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-analysis-${{ github.run_id }}
+          path: sonar-report
+          retention-days: 14
+          if-no-files-found: warn
