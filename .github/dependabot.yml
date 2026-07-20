@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # ## GitHub Actions: keeps every action referenced by our workflows monitored for updates
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # ## npm: application dependencies declared in package.json
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # ## Docker: base image used by the application Dockerfile
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # ## Terraform: provider and module versions used by the EKS infra configuration
+  - package-ecosystem: "terraform"
+    directory: "/infra/terraform"
+    schedule:
+      interval: "weekly"

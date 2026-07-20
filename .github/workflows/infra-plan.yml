@@ -1,0 +1,119 @@
+## Infra plan: on every PR into dev, show what Terraform would change without
+## ever applying. This is the only automatic path that runs `terraform plan`.
+name: Infra Plan
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+defaults:
+  run:
+    working-directory: infra/terraform
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    steps:
+      # ## Source checkout: pull the PR's Terraform configuration
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ## AWS OIDC authentication: assume the bootstrapped GitHub Actions role, no long-lived keys
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::478546323821:role/ai-demo-dev-ganna-ai-gha
+          aws-region: us-west-2
+
+      # ## Secret retrieval: fetch the Datadog API key needed by the Terraform-managed
+      # ## Kubernetes secret, and export it as a TF_VAR_* without ever printing it
+      - name: Fetch Datadog secret from AWS Secrets Manager
+        run: |
+          secret_json=$(aws secretsmanager get-secret-value --secret-id /platform/dev/datadog --query SecretString --output text)
+          api_key=$(echo "$secret_json" | jq -r '.api_key')
+          echo "::add-mask::${api_key}"
+          echo "TF_VAR_datadog_api_key=${api_key}" >> "$GITHUB_ENV"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      # ## Terraform validation: formatting, init, and schema validation before planning
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        run: terraform validate
+
+      # ## Terraform plan: capture the real exit code via PIPESTATUS so a plan with
+      # ## changes (exit code 2) is never mistaken for an error (exit code 1)
+      - name: Terraform plan
+        id: plan
+        shell: bash
+        run: |
+          set +e
+          terraform plan -no-color -input=false -detailed-exitcode 2>&1 | tee plan-output.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0|2) exit 0 ;;
+            1)   exit 0 ;;
+            *)   echo "Unexpected Terraform exit code: $code" >&2; exit 1 ;;
+          esac
+
+      # ## PR comment: publish the plan output for review, reading it from disk to
+      # ## avoid injecting large/untrusted text through template interpolation
+      - name: Comment plan output on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'infra/terraform/plan-output.txt';
+            let body = fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : 'No plan output was generated.';
+
+            const header = `#### Terraform Plan (exit code: \`${{ steps.plan.outputs.exitcode }}\`)\n\n`;
+            const maxLen = 65000;
+            let truncated = false;
+            if (body.length > maxLen) {
+              body = body.slice(0, maxLen);
+              truncated = true;
+            }
+            let comment = `${header}\`\`\`\n${body}\n\`\`\`\n`;
+            if (truncated) {
+              comment += `\n_Plan output truncated - see the uploaded \`terraform-plan-output\` artifact for the full log._\n`;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment,
+            });
+
+      - name: Upload full plan output artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-output-${{ github.run_id }}
+          path: infra/terraform/plan-output.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      # ## Fail the job only on a genuine Terraform error (exit code 1); exit code 2
+      # ## just means the plan proposes changes, which is expected on a PR
+      - name: Fail on Terraform error
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1

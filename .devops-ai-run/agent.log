@@ -1,0 +1,25 @@
+All planned work is complete. Summary of what was created in the working tree (nothing committed, pushed, or applied — per the stop condition):
+
+**Build**
+- `Dockerfile` (multi-stage, non-root, node:20-alpine, port 3000, healthcheck hitting `/health`) + `.dockerignore`
+
+**Kubernetes manifests** (`deploy/k8s/`)
+- `namespace.yaml` (`ai-demo-dev`), `deployment.yaml` (probes, resources, security context, image placeholder), `service.yaml` (LoadBalancer)
+
+**Terraform infra** (`infra/terraform/`) — fresh EKS deploy since no prior state/files existed
+- New VPC (`ai-demo`, 3 public + 3 private subnets across 3 AZs), EKS cluster `ai-demo-dev` (k8s 1.35), managed node group (t3.medium, 2/1/4), ECR repo `ai-demo-dev` (immutable tags, scan-on-push), IAM roles all prefixed `ai-demo-dev-`, EKS access entry granting the GitHub Actions OIDC role cluster-admin (flagged to tighten later), default add-ons (vpc-cni, coredns, kube-proxy, ebs-csi via IRSA) plus Datadog via Helm with the API key wired through a Terraform variable
+- S3 backend configured to the given bucket/key with `use_lockfile`
+- Ran `terraform fmt -check`, `init -backend=false`, and `validate` — all pass (had to temporarily relax `required_version` because this sandbox only has Terraform 1.9.8 installed locally; the committed file correctly requires `>= 1.10.0` to match the `1.10.5` pinned in the workflows, and I reverted the sandbox tweak before finishing)
+
+**Workflows** (`.github/workflows/`)
+- `infra-plan.yml` (PR → plan only, PIPESTATUS-based exit handling, PR comment)
+- `infra-apply.yml` (workflow_call only, no PR permissions)
+- `deploy.yml` (push → infra job then build/Trivy-gate/push/ECR-scan/EKS deploy with correct namespace-wait ordering)
+- `sonar-analysis.yml` (OIDC → Secrets Manager token → idempotent SonarCloud project provisioning → scan)
+
+**Other**
+- `.github/dependabot.yml` (github-actions, npm, docker, terraform)
+- `deploy/secret-vars.dev.yaml` (datadog + sonarqube only, matching the operator secrets catalog — no runtime section since this app has no runtime secrets to wire)
+- `.gitignore` updated to exclude Terraform local state/cache
+
+One thing needs your/operator attention before this pipeline can actually run: the Trivy scanner image in `deploy.yml` is pinned as `aquasec/trivy@sha256:REPLACE_WITH_OPERATOR_REVIEWED_DIGEST` — I couldn't resolve a live digest because this sandbox's permission mode blocks outbound `curl`/`wget` to Docker Hub. The workflow has a comment with the exact `docker buildx imagetools inspect` command to resolve and pin it.

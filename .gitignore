@@ -1,1 +1,8 @@
 node_modules
+
+# Terraform local working files - never commit provider/module caches or plan output
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/plan-output.txt
+infra/terraform/*.tfplan

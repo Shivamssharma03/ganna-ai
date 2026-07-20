@@ -1,0 +1,57 @@
+## Infra apply: reusable workflow, only ever invoked by deploy.yml's `infra` job
+## on push to dev. Never triggered directly, so it never needs PR permissions.
+name: Infra Apply
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  id-token: write
+
+defaults:
+  run:
+    working-directory: infra/terraform
+
+jobs:
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    steps:
+      # ## Source checkout: pull the Terraform configuration that is about to be applied
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ## AWS OIDC authentication: assume the bootstrapped GitHub Actions role, no long-lived keys
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::478546323821:role/ai-demo-dev-ganna-ai-gha
+          aws-region: us-west-2
+
+      # ## Secret retrieval: fetch the Datadog API key needed by the Terraform-managed
+      # ## Kubernetes secret, and export it as a TF_VAR_* without ever printing it
+      - name: Fetch Datadog secret from AWS Secrets Manager
+        run: |
+          secret_json=$(aws secretsmanager get-secret-value --secret-id /platform/dev/datadog --query SecretString --output text)
+          api_key=$(echo "$secret_json" | jq -r '.api_key')
+          echo "::add-mask::${api_key}"
+          echo "TF_VAR_datadog_api_key=${api_key}" >> "$GITHUB_ENV"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      # ## Terraform validation: init and schema validation before applying
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        run: terraform validate
+
+      # ## Terraform apply: idempotent - reports "No changes" and exits quickly
+      # ## once the cluster/VPC/node group/add-ons already match this configuration
+      - name: Terraform apply
+        run: terraform apply -auto-approve -input=false

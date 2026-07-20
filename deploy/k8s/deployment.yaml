@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-demo
+  namespace: ai-demo-dev
+  labels:
+    app.kubernetes.io/name: ai-demo
+    app.kubernetes.io/environment: dev
+  annotations:
+    # ## Operator note: this annotation is informational only; the deploy workflow
+    # ## updates the container image directly via `kubectl set image`.
+    description: "ai-demo dev deployment on EKS"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ai-demo
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ai-demo
+        app.kubernetes.io/environment: dev
+    spec:
+      containers:
+        - name: ai-demo
+          # Replaced by the deploy workflow with the digest-qualified ECR image.
+          image: IMAGE_PLACEHOLDER
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            # Runtime secrets are injected via Kubernetes Secret ai-demo-runtime,
+            # populated by the deploy workflow from AWS Secrets Manager - see
+            # deploy/secret-vars.dev.yaml for the source mapping.
+            - name: DD_AGENT_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+      securityContext:
+        fsGroup: 1000

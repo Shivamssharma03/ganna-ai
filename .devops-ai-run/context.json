@@ -1,0 +1,14 @@
+{
+  "workspace": "/opt/devops-ai/workspaces/ganna-ai",
+  "issue": "DEP-72",
+  "comment_id": "10974",
+  "repo": "ganna-ai",
+  "github_owner": "Shivamssharma03",
+  "source_branch": "dev",
+  "target_branch": "dev",
+  "env": "dev",
+  "application_name": "ai-demo",
+  "platform": "eks",
+  "github_actions_role_arn": "arn:aws:iam::478546323821:role/ai-demo-dev-ganna-ai-gha",
+  "github_actions_role_policy_arn": "arn:aws:iam::478546323821:policy/ai-demo-dev-ganna-ai-gha-eks"
+}

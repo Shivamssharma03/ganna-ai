@@ -1,0 +1,243 @@
+## Deploy: single push-triggered entry point for dev. Infra always runs first
+## (job `infra`), then the application build/scan/deploy only runs once infra
+## has succeeded - this ordering, not the trigger, is what guarantees infra
+## is up to date before the app is ever deployed.
+name: Deploy
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  # ## Infra phase: apply Terraform (VPC, EKS, node group, ECR, add-ons) so the
+  # ## cluster this push deploys into always reflects the committed configuration
+  infra:
+    name: Infra
+    uses: ./.github/workflows/infra-apply.yml
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+
+  build-and-deploy:
+    name: Build, Scan, and Deploy
+    needs: infra
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-west-2
+      ECR_REPOSITORY: ai-demo-dev
+      EKS_CLUSTER_NAME: ai-demo-dev
+      K8S_NAMESPACE: ai-demo-dev
+    steps:
+      # ## Source checkout: full history so the change-detection step below can diff commits
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ## Change detection: skip the build/deploy steps when this push touched
+      # ## nothing application-related, but always deploy on the very first push
+      - name: Detect application changes
+        id: changes
+        shell: bash
+        run: |
+          if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            echo "First push on this branch - treating as changed"
+            echo "app_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed_files=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")
+          echo "Changed files:"
+          echo "$changed_files"
+
+          if echo "$changed_files" | grep -qE '^(app\.js|server\.js|package\.json|package-lock\.json|Dockerfile|\.dockerignore|deploy/k8s/)'; then
+            echo "app_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "app_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ## Dependency installation and tests: verify the app before building an image
+      - name: Setup Node.js
+        if: steps.changes.outputs.app_changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        if: steps.changes.outputs.app_changed == 'true'
+        run: npm ci
+
+      - name: Run unit tests
+        if: steps.changes.outputs.app_changed == 'true'
+        run: npm test
+
+      # ## AWS OIDC authentication: assume the bootstrapped GitHub Actions role, no long-lived keys
+      - name: Configure AWS credentials
+        if: steps.changes.outputs.app_changed == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::478546323821:role/ai-demo-dev-ganna-ai-gha
+          aws-region: us-west-2
+
+      - name: Login to Amazon ECR
+        if: steps.changes.outputs.app_changed == 'true'
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ## Container build: tag with the immutable commit SHA, never deploy or scan "latest"
+      - name: Build Docker image
+        if: steps.changes.outputs.app_changed == 'true'
+        run: |
+          docker build -t "${{ steps.ecr-login.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}" .
+
+      # ## Trivy pre-push scan: generate an HTML evidence report, then gate the push
+      # ## on HIGH/CRITICAL findings against the same local image. The scanner image
+      # ## is pinned to an immutable digest, never a floating tag.
+      #
+      # Operator action required: resolve and pin the digest for the desired Trivy
+      # release before first use, e.g.:
+      #   docker buildx imagetools inspect aquasec/trivy:0.58.1 --format '{{json .Manifest}}' | jq -r .digest
+      # then replace the placeholder digest below.
+      - name: Prepare Trivy report directory
+        if: steps.changes.outputs.app_changed == 'true'
+        run: mkdir -p "${{ github.workspace }}/trivy-report"
+
+      - name: Generate Trivy HTML report
+        if: steps.changes.outputs.app_changed == 'true'
+        env:
+          TRIVY_IMAGE: aquasec/trivy@sha256:REPLACE_WITH_OPERATOR_REVIEWED_DIGEST
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ github.workspace }}/trivy-report:/trivy-report" \
+            "${TRIVY_IMAGE}" image \
+            --format template --template "@contrib/html.tpl" \
+            --severity HIGH,CRITICAL --no-progress --exit-code 0 \
+            --output /trivy-report/trivy-report.html \
+            "${{ steps.ecr-login.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+
+      - name: Generate Trivy JSON report
+        if: steps.changes.outputs.app_changed == 'true'
+        env:
+          TRIVY_IMAGE: aquasec/trivy@sha256:REPLACE_WITH_OPERATOR_REVIEWED_DIGEST
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ github.workspace }}/trivy-report:/trivy-report" \
+            "${TRIVY_IMAGE}" image \
+            --format json --severity HIGH,CRITICAL --no-progress --exit-code 0 \
+            --output /trivy-report/trivy-report.json \
+            "${{ steps.ecr-login.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+
+      - name: Trivy vulnerability gate
+        if: steps.changes.outputs.app_changed == 'true'
+        env:
+          TRIVY_IMAGE: aquasec/trivy@sha256:REPLACE_WITH_OPERATOR_REVIEWED_DIGEST
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ github.workspace }}/trivy-report:/trivy-report" \
+            "${TRIVY_IMAGE}" image \
+            --format table --severity HIGH,CRITICAL --no-progress --exit-code 1 \
+            "${{ steps.ecr-login.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+
+      - name: Upload Trivy report artifact
+        if: always() && steps.changes.outputs.app_changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-security-report-${{ github.run_id }}
+          path: ${{ github.workspace }}/trivy-report
+          if-no-files-found: error
+          retention-days: 14
+
+      # ## ECR push and server-side scan: only a Trivy-clean image is ever pushed;
+      # ## the pushed digest is then re-checked against ECR's own scan before deploy
+      - name: Push image to ECR
+        if: steps.changes.outputs.app_changed == 'true'
+        run: |
+          docker push "${{ steps.ecr-login.outputs.registry }}/${ECR_REPOSITORY}:${{ github.sha }}"
+
+      - name: Resolve pushed image digest
+        if: steps.changes.outputs.app_changed == 'true'
+        id: image
+        run: |
+          digest=$(aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageTag="${{ github.sha }}" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image digest: ${digest}"
+
+      - name: Wait for ECR image scan and evaluate findings
+        if: steps.changes.outputs.app_changed == 'true'
+        run: |
+          digest="${{ steps.image.outputs.digest }}"
+          status="IN_PROGRESS"
+          for i in $(seq 1 30); do
+            status=$(aws ecr describe-image-scan-findings \
+              --repository-name "${ECR_REPOSITORY}" \
+              --image-id imageDigest="${digest}" \
+              --query 'imageScanStatus.status' --output text 2>/dev/null || echo "IN_PROGRESS")
+            echo "ECR scan status: ${status}"
+            if [ "${status}" = "COMPLETE" ] || [ "${status}" = "FAILED" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "${status}" != "COMPLETE" ]; then
+            echo "ECR image scan did not complete in time (last status: ${status})" >&2
+            exit 1
+          fi
+
+          counts=$(aws ecr describe-image-scan-findings \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-id imageDigest="${digest}" \
+            --query 'imageScanFindings.findingSeverityCounts' --output json)
+          echo "Finding severity counts: ${counts}"
+
+          high=$(echo "${counts}" | jq -r '.HIGH // 0')
+          critical=$(echo "${counts}" | jq -r '.CRITICAL // 0')
+          if [ "${high}" -gt 0 ] || [ "${critical}" -gt 0 ]; then
+            echo "ECR scan found ${critical} CRITICAL and ${high} HIGH severity findings - blocking deployment" >&2
+            exit 1
+          fi
+
+      # ## Application deployment: point kubectl at the EKS cluster via the OIDC role,
+      # ## bring up the namespace first and wait for it to be Active, then roll out
+      # ## the digest-qualified image and verify the rollout
+      - name: Update kubeconfig
+        if: steps.changes.outputs.app_changed == 'true'
+        run: aws eks update-kubeconfig --region "${AWS_REGION}" --name "${EKS_CLUSTER_NAME}"
+
+      - name: Apply namespace and wait for Active
+        if: steps.changes.outputs.app_changed == 'true'
+        run: |
+          kubectl apply -f deploy/k8s/namespace.yaml
+          kubectl wait --for=jsonpath='{.status.phase}'=Active \
+            namespace/${K8S_NAMESPACE} --timeout=60s
+          sleep 5
+
+      - name: Apply application manifests
+        if: steps.changes.outputs.app_changed == 'true'
+        run: |
+          kubectl apply -f deploy/k8s/deployment.yaml -f deploy/k8s/service.yaml
+
+      - name: Update deployment image
+        if: steps.changes.outputs.app_changed == 'true'
+        run: |
+          image="${{ steps.ecr-login.outputs.registry }}/${ECR_REPOSITORY}@${{ steps.image.outputs.digest }}"
+          kubectl set image deployment/ai-demo ai-demo="${image}" -n "${K8S_NAMESPACE}"
+
+      - name: Wait for rollout
+        if: steps.changes.outputs.app_changed == 'true'
+        run: |
+          kubectl rollout status deployment/ai-demo -n "${K8S_NAMESPACE}" --timeout=180s

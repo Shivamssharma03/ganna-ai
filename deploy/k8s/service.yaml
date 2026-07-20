@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-demo
+  namespace: ai-demo-dev
+  labels:
+    app.kubernetes.io/name: ai-demo
+    app.kubernetes.io/environment: dev
+spec:
+  # Default per platform instructions: expose directly via a cloud LoadBalancer.
+  # Switch to ClusterIP/NodePort/Ingress if the ticket later asks for it.
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: ai-demo
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
