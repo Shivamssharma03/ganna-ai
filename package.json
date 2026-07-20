@@ -1,0 +1,32 @@
+{
+  "name": "ai-agent",
+  "version": "1.0.0",
+  "description": "Node.js Express application with unit testing",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js",
+    "test": "jest",
+    "test:coverage": "jest --coverage",
+    "test:watch": "jest --watch"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "jest": "^30.4.2",
+    "supertest": "^7.2.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Shivamssharma03/agent-unit-testing08.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Shivamssharma03/agent-unit-testing08/issues"
+  },
+  "homepage": "https://github.com/Shivamssharma03/agent-unit-testing08#readme",
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
