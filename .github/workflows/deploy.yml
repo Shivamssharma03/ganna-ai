@@ -1,0 +1,177 @@
+name: Deploy
+
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  # ## Infra-first ordering: this always runs before the app deploy, including on the very first push to
+  # a repo with no existing infra - build-and-deploy cannot start until this job succeeds.
+  infra:
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/infra-apply.yml
+    secrets: inherit
+
+  build-and-deploy:
+    needs: infra
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # ## Source checkout: retrieve the code that triggered this push
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ## Change detection: skip build/deploy when this push touched only infra/docs; always deploy on the
+      # very first push (github.event.before is the all-zero SHA, so there's nothing to diff against).
+      - name: Detect application changes
+        id: changes
+        run: |
+          zero="0000000000000000000000000000000000000000"
+          if [ "${{ github.event.before }}" = "$zero" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep -Ev '^(infra/|README\.md)' | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ## AWS OIDC authentication: assume the bootstrapped GitHub Actions role, never long-lived keys
+      - name: Configure AWS credentials
+        if: steps.changes.outputs.changed == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::478546323821:role/ai-demogaanaai-devops-dev-gha
+          aws-region: us-west-2
+
+      # ## Dependency installation and tests: verify application behavior before packaging it
+      - name: Setup Node.js
+        if: steps.changes.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        if: steps.changes.outputs.changed == 'true'
+        run: npm ci
+
+      - name: Run unit tests
+        if: steps.changes.outputs.changed == 'true'
+        run: npm test
+
+      # ## Container build: package into an immutable, commit-SHA-tagged image - never build/deploy only "latest"
+      - name: Build Docker image
+        if: steps.changes.outputs.changed == 'true'
+        run: docker build -t ai-demogaanaai-devops-dev:${{ github.sha }} .
+
+      # ## Trivy pre-push scan: advisory vulnerability report on the local image; findings never block the pipeline
+      - name: Generate Trivy HTML report
+        if: steps.changes.outputs.changed == 'true'
+        continue-on-error: true
+        run: |
+          mkdir -p "${{ github.workspace }}/trivy-report"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ github.workspace }}/trivy-report:/trivy-report" \
+            aquasec/trivy:0.53.0 image \
+            --format template --template "@contrib/html.tpl" \
+            --severity HIGH,CRITICAL --no-progress --exit-code 0 \
+            -o /trivy-report/trivy-report.html \
+            ai-demogaanaai-devops-dev:${{ github.sha }}
+
+      - name: Trivy table summary
+        if: steps.changes.outputs.changed == 'true'
+        continue-on-error: true
+        run: |
+          mkdir -p trivy-report
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.53.0 image \
+            --severity HIGH,CRITICAL --no-progress --exit-code 0 \
+            ai-demogaanaai-devops-dev:${{ github.sha }} | tee trivy-report/trivy-summary.txt
+
+      - name: Generate Trivy SARIF report
+        if: steps.changes.outputs.changed == 'true'
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ github.workspace }}/trivy-report:/trivy-report" \
+            aquasec/trivy:0.53.0 image \
+            --format sarif --severity HIGH,CRITICAL --no-progress --exit-code 0 \
+            -o /trivy-report/trivy-report.sarif \
+            ai-demogaanaai-devops-dev:${{ github.sha }}
+
+      - name: Upload Trivy report
+        if: always() && steps.changes.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-security-report-${{ github.run_id }}
+          path: trivy-report
+          retention-days: 14
+          if-no-files-found: error
+
+      # ## ECR push: publish the scanned image by tag, then resolve its digest for a digest-qualified deploy
+      - name: Login to ECR
+        if: steps.changes.outputs.changed == 'true'
+        run: aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 478546323821.dkr.ecr.us-west-2.amazonaws.com
+
+      - name: Tag and push image
+        if: steps.changes.outputs.changed == 'true'
+        id: push
+        run: |
+          set -euo pipefail
+          repo_url="478546323821.dkr.ecr.us-west-2.amazonaws.com/ai-demogaanaai-devops-dev"
+          docker tag ai-demogaanaai-devops-dev:${{ github.sha }} "$repo_url:${{ github.sha }}"
+          docker push "$repo_url:${{ github.sha }}"
+          digest=$(aws ecr describe-images --repository-name ai-demogaanaai-devops-dev --image-ids imageTag=${{ github.sha }} --query 'imageDetails[0].imageDigest' --output text)
+          echo "image=$repo_url@$digest" >> "$GITHUB_OUTPUT"
+
+      # ## ECR server-side scan: report severity counts; advisory only, deployment proceeds regardless
+      - name: Wait for ECR scan and report findings
+        if: steps.changes.outputs.changed == 'true'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          deadline=$((SECONDS + 300))
+          status="IN_PROGRESS"
+          while [ $SECONDS -lt $deadline ]; do
+            status=$(aws ecr describe-image-scan-findings --repository-name ai-demogaanaai-devops-dev --image-id imageTag=${{ github.sha }} --query 'imageScanStatus.status' --output text 2>/dev/null || echo "IN_PROGRESS")
+            if [ "$status" = "COMPLETE" ] || [ "$status" = "FAILED" ]; then
+              break
+            fi
+            sleep 15
+          done
+          echo "ECR scan status: $status"
+          if [ "$status" = "COMPLETE" ]; then
+            aws ecr describe-image-scan-findings --repository-name ai-demogaanaai-devops-dev --image-id imageTag=${{ github.sha }} --query 'imageScanFindings.findingSeverityCounts' --output json
+          fi
+
+      # ## Application deployment: namespace first (wait for Active + settle), then workload manifests and rollout
+      - name: Update kubeconfig
+        if: steps.changes.outputs.changed == 'true'
+        run: aws eks update-kubeconfig --name ai-demogaanaai-devops-dev --region us-west-2
+
+      - name: Apply namespace and wait for Active
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          kubectl apply -f deploy/k8s/namespace.yaml
+          kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/ai-demogaanaai-devops-dev --timeout=60s
+          sleep 5
+
+      - name: Apply remaining manifests
+        if: steps.changes.outputs.changed == 'true'
+        run: kubectl apply -f deploy/k8s/deployment.yaml -f deploy/k8s/service.yaml
+
+      - name: Set deployed image and wait for rollout
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          kubectl set image deployment/ai-demogaanaai-devops ai-demogaanaai-devops=${{ steps.push.outputs.image }} -n ai-demogaanaai-devops-dev
+          kubectl rollout status deployment/ai-demogaanaai-devops -n ai-demogaanaai-devops-dev --timeout=300s

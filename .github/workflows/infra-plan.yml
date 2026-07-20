@@ -1,0 +1,100 @@
+name: Infra Plan
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      # ## Source checkout: pull the PR's proposed Terraform configuration
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ## AWS OIDC authentication: assume the bootstrapped GitHub Actions role, never long-lived keys
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::478546323821:role/ai-demogaanaai-devops-dev-gha
+          aws-region: us-west-2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      # ## Terraform validation: formatting, init, and config validity before planning
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform validate
+        run: terraform validate
+
+      # ## Terraform plan: compute proposed infra changes; exit code 2 (changes present) is expected, not a failure
+      - name: Terraform plan
+        id: plan
+        shell: bash
+        run: |
+          set +e
+          terraform plan -no-color -input=false -detailed-exitcode 2>&1 | tee plan-output.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          case "$code" in
+            0|2) exit 0 ;;
+            1)   exit 0 ;;
+            *)   echo "Unexpected Terraform exit code: $code" >&2; exit 1 ;;
+          esac
+
+      # ## PR comment: publish the plan for review, reading from disk to avoid unsafe interpolation
+      - name: Comment plan on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'infra/terraform/plan-output.txt';
+            let body = fs.readFileSync(path, 'utf8');
+            const maxLen = 60000;
+            let truncated = false;
+            if (body.length > maxLen) {
+              body = body.slice(0, maxLen);
+              truncated = true;
+            }
+            let comment = "## Terraform Plan\n```\n" + body + "\n```";
+            if (truncated) {
+              comment += "\n\n_Plan output truncated - see the uploaded plan artifact for the full log._";
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment,
+            });
+
+      - name: Upload full plan output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: infra/terraform/plan-output.txt
+          retention-days: 14
+          if-no-files-found: warn
+
+      # ## Fail the job only on a real Terraform error (exit code 1), never on "changes present" (2)
+      - name: Fail on Terraform error
+        if: steps.plan.outputs.exitcode == '1'
+        run: exit 1

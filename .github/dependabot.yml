@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # ## GitHub Actions: keep workflow action references patched
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # ## npm: keep the Node.js/Express application dependencies patched
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # ## Docker: keep the application base image patched
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # ## Terraform: keep pinned providers/modules patched
+  - package-ecosystem: "terraform"
+    directory: "/infra/terraform"
+    schedule:
+      interval: "weekly"

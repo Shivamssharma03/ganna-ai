@@ -1,0 +1,18 @@
+All files are written and Terraform validation passes. Summary of what was created for **DEP-72** (ganna-ai, dev/EKS):
+
+**Infra (`infra/terraform/`)** — fresh deployment (existing directory only had a stale, empty `.terraform` cache, no real `.tf` files):
+- `versions.tf` — S3 backend (`devops-ai-tfstate-478546323821`, key `ai-demogaanaai-devops/dev/terraform.tfstate`, native `use_lockfile` locking), provider pins
+- `main.tf` — new VPC (3 public/3 private subnets, single NAT), EKS cluster 1.35 with managed node group, IRSA roles for EBS CSI + VPC CNI, `vpc-cni`/`coredns`/`kube-proxy`/`aws-ebs-csi-driver` add-ons (`vpc-cni` with `before_compute`), EKS access entry for the GitHub Actions role, ECR repo, Datadog via Helm
+- `variables.tf` / `outputs.tf`
+
+**K8s (`deploy/k8s/`)** — namespace, deployment (probes on `/health`, resource limits), LoadBalancer service, image placeholder for the deploy workflow.
+
+**Build** — `Dockerfile` (multi-stage, non-root), `.dockerignore`.
+
+**Workflows (`.github/workflows/`)** — `infra-plan.yml` (PR plan+comment), `infra-apply.yml` (push apply with the mandated VPC-first sequencing, node-group health gate, and one-time guarded `CREATE_FAILED` recovery), `deploy.yml` (infra-then-app push pipeline with Trivy + ECR scan reporting and namespace-ordered rollout), `sonar-analysis.yml` (SonarCloud via OIDC + Secrets Manager token).
+
+**Other** — `.github/dependabot.yml` (github-actions/npm/docker/terraform), `deploy/secret-vars.dev.yaml` (datadog + sonarqube references only), `sonar-project.properties`, `.gitignore` updated for Terraform/scan artifacts.
+
+**Note on module versions**: the platform instructions' example snippets assume the EKS module's v20-style interface, but validating locally showed the current registry EKS module compatible with the mandated new `iam-role-for-service-accounts` IRSA submodule (AWS provider v6) is now major version 21, which renamed several inputs (`name` instead of `cluster_name`, `kubernetes_version` instead of `cluster_version`, `endpoint_private_access`/`endpoint_public_access`, `addons` instead of `cluster_addons`). I used v21's actual field names while preserving every required behavior (before_compute ordering, explicit IAM naming, node-group timeouts, etc.) — `terraform validate` passes against the real pinned module interfaces.
+
+`terraform fmt -check -recursive` and `terraform validate` both pass (validated with a temporarily relaxed `required_version` since this EC2 host's local Terraform binary is 1.9.8; the real `>= 1.10.5` pin is restored in the committed file — CI installs 1.10.5 via `hashicorp/setup-terraform` regardless). No commit/push/PR was made per the stop condition.
